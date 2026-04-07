@@ -582,7 +582,7 @@ buildSchema:
   Query.abc123UsersPublicAccounts -> PgSelectStep(resource)
 
 SQL generation:
-  SELECT "abc123_users_public"."accounts"."id", ... FROM "abc123_users_public"."accounts"
+  select "abc123_users_public"."accounts"."id", ... from "abc123_users_public"."accounts"
 ```
 
 A second tenant with prefix `def456_` would produce an identical structure but with `def456_` everywhere that `abc123_` appears. The structural fingerprint (column types, constraints, relations) would be identical.
