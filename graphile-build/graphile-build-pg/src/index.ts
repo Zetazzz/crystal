@@ -1,6 +1,12 @@
 import type { PgRegistry } from "@dataplan/pg";
 
 import type { PartitionExpose } from "./interfaces.ts";
+export {
+  buildSchemaRemapTransform,
+  extractTemplateSchemaNames,
+  PGMT_PREFIX,
+  PGMT_SUFFIX,
+} from "./multiTenancy.ts";
 export { PgAllRowsPlugin } from "./plugins/PgAllRowsPlugin.ts";
 export { PgAttributeDeprecationPlugin } from "./plugins/PgAttributeDeprecationPlugin.ts";
 export { PgAttributesPlugin } from "./plugins/PgAttributesPlugin.ts";

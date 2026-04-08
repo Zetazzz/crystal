@@ -135,6 +135,16 @@ export type PgExecutorContext<
 > = {
   pgSettings: TSettings;
   withPgClient: WithPgClient<TPgClient>;
+  /**
+   * Optional callback to transform SQL text before execution. This is
+   * called once per query with the compiled SQL string and should return
+   * the (possibly modified) SQL to send to PostgreSQL.
+   *
+   * Intended for multi-tenancy use cases where schema-qualified
+   * identifiers contain template placeholders (e.g. `"__pgmt_myschema__"`)
+   * that must be replaced with the real tenant schema name at runtime.
+   */
+  sqlTextTransform?: (text: string) => string;
 };
 
 /** @deprecated Please use `Step<PgExecutorContext<TSettings>>` instead */
@@ -352,11 +362,15 @@ ${duration}
     name?: string,
     publish?: PublishFunction,
   ) {
+    // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
+    const finalText = context.sqlTextTransform
+      ? context.sqlTextTransform(text)
+      : text;
     // PERF: we could probably make this more efficient by grouping the
     // deferreds further, DataLoader-style, and running one SQL query for
     // everything.
     return await context.withPgClient(context.pgSettings, (client) =>
-      this._executeWithClient<TData>(client, text, values, name, publish),
+      this._executeWithClient<TData>(client, finalText, values, name, publish),
     );
   }
 
@@ -624,7 +638,7 @@ ${duration}
   ): Promise<{
     streams: Array<AsyncIterable<TOutput> | PromiseLike<never>>;
   }> {
-    const { text, rawSqlValues, identifierIndex } = common;
+    const { text: rawText, rawSqlValues, identifierIndex } = common;
 
     const valuesCount = values.length;
     const streams: Array<AsyncIterable<TOutput> | Promise<never> | null> = [];
@@ -652,6 +666,10 @@ ${duration}
     // For each context, run the relevant fetches
     const promises: Promise<void>[] = [];
     for (const [context, batch] of groupMap.entries()) {
+      // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
+      const text = context.sqlTextTransform
+        ? context.sqlTextTransform(rawText)
+        : rawText;
       // ENHANCE: this is a mess, we should refactor and simplify it significantly
       const { resolve: resolveTx, promise: tx } = promiseWithResolve<void>();
       let txResolved = false;
@@ -941,11 +959,16 @@ ${duration}
     const { context, text, values } = options;
     const { withPgClient, pgSettings } = context;
 
+    // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
+    const finalText = context.sqlTextTransform
+      ? context.sqlTextTransform(text)
+      : text;
+
     // We don't explicitly need a transaction for mutations
     const queryResult = await withPgClient(pgSettings, (client) =>
       this._executeWithClient<TData>(
         client,
-        text,
+        finalText,
         values,
         undefined,
         undefined,
