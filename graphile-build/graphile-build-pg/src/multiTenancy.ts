@@ -57,7 +57,7 @@ declare global {
        * string before sending it to PostgreSQL.  Intended for
        * multi-tenancy schema remapping via `pgIdentifiers: "dynamic"`.
        */
-      pgSqlTextTransform?: ((text: string) => string) | undefined;
+      pgSqlTextTransform: ((text: string) => string) | undefined;
     }
   }
 }
