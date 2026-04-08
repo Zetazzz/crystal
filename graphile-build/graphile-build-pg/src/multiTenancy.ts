@@ -28,6 +28,41 @@
  */
 
 /**
+ * Well-known Grafast context key for injecting a per-request
+ * `sqlTextTransform` into the `PgExecutorContext`.  Set this key
+ * in your `grafast.context` callback to have the transform applied
+ * to every SQL statement before it is sent to PostgreSQL.
+ *
+ * @example
+ * ```ts
+ * const preset = {
+ *   grafast: {
+ *     context(ctx) {
+ *       return {
+ *         pgSqlTextTransform: myTransformFn,
+ *       };
+ *     },
+ *   },
+ * };
+ * ```
+ */
+export const PG_SQL_TEXT_TRANSFORM_CONTEXT_KEY = "pgSqlTextTransform";
+
+declare global {
+  namespace Grafast {
+    interface Context {
+      /**
+       * Optional per-request SQL text transform.  When set, the
+       * `PgExecutor` will call this function on every compiled SQL
+       * string before sending it to PostgreSQL.  Intended for
+       * multi-tenancy schema remapping via `pgIdentifiers: "dynamic"`.
+       */
+      pgSqlTextTransform?: ((text: string) => string) | undefined;
+    }
+  }
+}
+
+/**
  * The prefix added to schema names in dynamic identifier mode.
  * A compiled SQL identifier will look like `"__pgmt_myschema__"`.
  */
