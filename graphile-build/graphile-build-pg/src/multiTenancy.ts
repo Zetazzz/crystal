@@ -2,17 +2,16 @@
  * Multi-tenancy utilities for dynamic schema resolution.
  *
  * When `pgIdentifiers` is set to `"dynamic"`, schema names in SQL
- * identifiers are wrapped with the `PGMT_PREFIX` / `PGMT_SUFFIX`
- * placeholders. At execution time, a `sqlTextTransform` function
+ * identifiers are wrapped in opaque placeholders during the gather/build
+ * phase.  At execution time a per-request `sqlTextTransform` function
  * (set on `PgExecutorContext`) replaces these placeholders with the
  * real tenant schema names.
  *
  * @example
  * ```ts
  * import {
- *   PGMT_PREFIX,
- *   PGMT_SUFFIX,
  *   buildSchemaRemapTransform,
+ *   wrapSchemaPlaceholder,
  * } from "graphile-build-pg/multiTenancy";
  *
  * // Template was built against schemas: ['app_schema', 'perf_schema']
@@ -27,26 +26,7 @@
  * ```
  */
 
-/**
- * Well-known Grafast context key for injecting a per-request
- * `sqlTextTransform` into the `PgExecutorContext`.  Set this key
- * in your `grafast.context` callback to have the transform applied
- * to every SQL statement before it is sent to PostgreSQL.
- *
- * @example
- * ```ts
- * const preset = {
- *   grafast: {
- *     context(ctx) {
- *       return {
- *         pgSqlTextTransform: myTransformFn,
- *       };
- *     },
- *   },
- * };
- * ```
- */
-export const PG_SQL_TEXT_TRANSFORM_CONTEXT_KEY = "pgSqlTextTransform";
+import { escapeSqlIdentifier } from "pg-sql2";
 
 declare global {
   namespace Grafast {
@@ -62,20 +42,49 @@ declare global {
   }
 }
 
-/**
- * The prefix added to schema names in dynamic identifier mode.
- * A compiled SQL identifier will look like `"__pgmt_myschema__"`.
- */
-export const PGMT_PREFIX = "__pgmt_";
+// ---------------------------------------------------------------------------
+// Placeholder encoding — private constants, public helper functions
+// ---------------------------------------------------------------------------
+
+/** @internal Prefix for dynamic schema placeholders. */
+const PGMT_PREFIX = "__pgmt_";
+
+/** @internal Suffix for dynamic schema placeholders. */
+const PGMT_SUFFIX = "__";
 
 /**
- * The suffix added to schema names in dynamic identifier mode.
+ * Wrap a schema name in the placeholder markers used by `pgIdentifiers:
+ * "dynamic"`.  The result is a raw string (e.g. `__pgmt_app_public__`)
+ * suitable for passing to `sql.identifier()`.
  */
-export const PGMT_SUFFIX = "__";
+export function wrapSchemaPlaceholder(schemaName: string): string {
+  return `${PGMT_PREFIX}${schemaName}${PGMT_SUFFIX}`;
+}
+
+/**
+ * Returns `true` if `name` looks like a dynamic schema placeholder.
+ */
+export function isSchemaPlaceholder(name: string): boolean {
+  return name.startsWith(PGMT_PREFIX) && name.endsWith(PGMT_SUFFIX);
+}
+
+// ---------------------------------------------------------------------------
+// SQL text transform
+// ---------------------------------------------------------------------------
+
+/** Escape special regex metacharacters in a literal string. */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
  * Build a `sqlTextTransform` function that replaces dynamic schema
  * placeholders with real tenant schema names.
+ *
+ * The function performs a **single-pass** regex replacement over the
+ * compiled SQL text, using `escapeSqlIdentifier` from pg-sql2 so that
+ * schema names containing special characters (double quotes, etc.) are
+ * handled safely.
  *
  * @param schemaMap - A mapping from template schema names to real
  *   tenant schema names. E.g. `{ app_public: 'tenant_42_public' }`.
@@ -89,28 +98,33 @@ export function buildSchemaRemapTransform(
     return (text: string) => text;
   }
 
-  // Pre-compute the search/replace pairs for efficiency.
-  // In compiled SQL, the placeholder appears as a quoted identifier:
-  //   "__pgmt_original_schema__"
-  // We replace it with the quoted real schema name:
-  //   "real_schema"
-  const replacements: Array<[search: string, replace: string]> = entries.map(
-    ([templateSchema, realSchema]) => [
-      `"${PGMT_PREFIX}${templateSchema}${PGMT_SUFFIX}"`,
-      `"${realSchema}"`,
-    ],
-  );
+  // Pre-compute a lookup map: escaped placeholder → escaped real name.
+  // Both sides use pg-sql2's escapeSqlIdentifier so the search string
+  // matches exactly what sql.identifier() produces at compile time, and
+  // the replacement is a properly escaped SQL identifier.
+  const lookupMap = new Map<string, string>();
+  const regexParts: string[] = [];
+
+  for (const [templateSchema, realSchema] of entries) {
+    const placeholder = escapeSqlIdentifier(
+      wrapSchemaPlaceholder(templateSchema),
+    );
+    const replacement = escapeSqlIdentifier(realSchema);
+    lookupMap.set(placeholder, replacement);
+    regexParts.push(escapeRegExp(placeholder));
+  }
+
+  // Single compiled regex that matches any placeholder in one pass.
+  const regex = new RegExp(regexParts.join("|"), "g");
 
   return (text: string): string => {
-    let result = text;
-    for (let i = 0, l = replacements.length; i < l; i++) {
-      const [search, replace] = replacements[i];
-      // Use split+join for global replacement (avoids regex escaping issues)
-      result = result.split(search).join(replace);
-    }
-    return result;
+    return text.replace(regex, (match) => lookupMap.get(match)!);
   };
 }
+
+// ---------------------------------------------------------------------------
+// Extraction helper
+// ---------------------------------------------------------------------------
 
 /**
  * Extracts the original schema names from a list of placeholder schema
@@ -125,7 +139,7 @@ export function extractTemplateSchemaNames(
   placeholderSchemas: string[],
 ): string[] {
   return placeholderSchemas.map((s) => {
-    if (s.startsWith(PGMT_PREFIX) && s.endsWith(PGMT_SUFFIX)) {
+    if (isSchemaPlaceholder(s)) {
       return s.slice(PGMT_PREFIX.length, -PGMT_SUFFIX.length);
     }
     return s;

@@ -4,9 +4,8 @@ import type { PartitionExpose } from "./interfaces.ts";
 export {
   buildSchemaRemapTransform,
   extractTemplateSchemaNames,
-  PG_SQL_TEXT_TRANSFORM_CONTEXT_KEY,
-  PGMT_PREFIX,
-  PGMT_SUFFIX,
+  isSchemaPlaceholder,
+  wrapSchemaPlaceholder,
 } from "./multiTenancy.ts";
 export { PgAllRowsPlugin } from "./plugins/PgAllRowsPlugin.ts";
 export { PgAttributeDeprecationPlugin } from "./plugins/PgAttributeDeprecationPlugin.ts";
