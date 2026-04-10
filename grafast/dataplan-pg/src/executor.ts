@@ -212,9 +212,34 @@ export class PgExecutor<const TName extends string = string, TSettings = any> {
     return this.contextCallback();
   }
 
+  /**
+   * Centralized SQL transformation gateway.  Every execution path MUST
+   * call this before sending SQL to the database driver.  If the context
+   * carries a `sqlTextTransform` (e.g. for multi-tenancy schema
+   * remapping), the transform is applied here — once, in one place.
+   *
+   * @param templateSql - The compiled SQL text, possibly containing
+   *   schema placeholders.
+   * @param context - The per-request executor context.
+   * @returns The executable SQL string, safe to send to PostgreSQL.
+   */
+  private prepareSql(
+    templateSql: string,
+    context: PgExecutorContext,
+  ): string {
+    return context.sqlTextTransform
+      ? context.sqlTextTransform(templateSql)
+      : templateSql;
+  }
+
+  /**
+   * Lowest-level query execution — sends SQL directly to the database
+   * driver.  Callers MUST pass SQL that has already been through
+   * `prepareSql()`; this method performs no transformation.
+   */
   private async _executeWithClient<TData>(
     client: PgClient,
-    text: string,
+    executableSql: string,
     values: ReadonlyArray<SQLRawValue>,
     name?: string,
     publish?: PublishFunction,
@@ -225,7 +250,7 @@ export class PgExecutor<const TName extends string = string, TSettings = any> {
     const start = process.hrtime.bigint();
     try {
       queryResult = await client.query({
-        text,
+        text: executableSql,
         values: values as SQLRawValue[],
         arrayMode: true,
         name,
@@ -237,13 +262,13 @@ export class PgExecutor<const TName extends string = string, TSettings = any> {
     // TODO: this should be based on the headers of the incoming request
     const shouldExplain = debugExplain.enabled;
     const explainAnalyzeSafe =
-      shouldExplain && !isMutation && /^\s*select/i.test(text);
+      shouldExplain && !isMutation && /^\s*select/i.test(executableSql);
     let explain: string | undefined = undefined;
     if (shouldExplain && !error) {
       const explainResult = await client.query<{ 0: string }>({
         text: `EXPLAIN (${
           explainAnalyzeSafe ? "ANALYZE, " : ""
-        }COSTS, VERBOSE, BUFFERS, SETTINGS) ${text}`,
+        }COSTS, VERBOSE, BUFFERS, SETTINGS) ${executableSql}`,
         values: values as SQLRawValue[],
         arrayMode: true,
       });
@@ -318,7 +343,7 @@ ${duration}
 
 `,
         LOOK_DOWN,
-        formatSQLForDebugging(text, error),
+        formatSQLForDebugging(executableSql, error),
         values,
         error ? error : rowResults,
         error
@@ -343,7 +368,7 @@ ${duration}
       );
     }
     if (publish !== undefined) {
-      publish(text, name, explain);
+      publish(executableSql, name, explain);
     }
     if (error) {
       throw error;
@@ -357,20 +382,17 @@ ${duration}
 
   private async _execute<TData>(
     context: PgExecutorContext,
-    text: string,
+    templateSql: string,
     values: ReadonlyArray<SQLRawValue>,
     name?: string,
     publish?: PublishFunction,
   ) {
-    // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
-    const finalText = context.sqlTextTransform
-      ? context.sqlTextTransform(text)
-      : text;
+    const executableSql = this.prepareSql(templateSql, context);
     // PERF: we could probably make this more efficient by grouping the
     // deferreds further, DataLoader-style, and running one SQL query for
     // everything.
     return await context.withPgClient(context.pgSettings, (client) =>
-      this._executeWithClient<TData>(client, finalText, values, name, publish),
+      this._executeWithClient<TData>(client, executableSql, values, name, publish),
     );
   }
 
@@ -380,8 +402,11 @@ ${duration}
   ): Promise<T> {
     return context.withPgClient<T>(context.pgSettings, (baseClient) =>
       baseClient.withTransaction((transactionClient) => {
-        const execute: ExecuteFunction = (text, values) =>
-          this._executeWithClient(transactionClient, text, values);
+        // NOTE: SQL passed to this execute function MUST already be
+        // through `prepareSql()` — the caller is responsible for
+        // transformation before constructing statements.
+        const execute: ExecuteFunction = (executableSql, values) =>
+          this._executeWithClient(transactionClient, executableSql, values);
         return callback(execute);
       }),
     );
@@ -549,7 +574,7 @@ ${duration}
             }
 
             if (remaining.length) {
-              const { text, name } = common;
+              const { text: templateSql, name } = common;
 
               const sqlValues =
                 identifierIndex == null
@@ -566,12 +591,12 @@ ${duration}
               const queryResult = common.useTransaction
                 ? await this.executeMutation<TOutput>({
                     context,
-                    text,
+                    text: templateSql,
                     values: sqlValues,
                   })
                 : await this._execute<TOutput>(
                     context,
-                    text,
+                    templateSql,
                     sqlValues,
                     name,
                     publishExecute,
@@ -638,7 +663,7 @@ ${duration}
   ): Promise<{
     streams: Array<AsyncIterable<TOutput> | PromiseLike<never>>;
   }> {
-    const { text: rawText, rawSqlValues, identifierIndex } = common;
+    const { text: templateSql, rawSqlValues, identifierIndex } = common;
 
     const valuesCount = values.length;
     const streams: Array<AsyncIterable<TOutput> | Promise<never> | null> = [];
@@ -666,10 +691,7 @@ ${duration}
     // For each context, run the relevant fetches
     const promises: Promise<void>[] = [];
     for (const [context, batch] of groupMap.entries()) {
-      // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
-      const text = context.sqlTextTransform
-        ? context.sqlTextTransform(rawText)
-        : rawText;
+      const executableSql = this.prepareSql(templateSql, context);
       // ENHANCE: this is a mess, we should refactor and simplify it significantly
       const { resolve: resolveTx, promise: tx } = promiseWithResolve<void>();
       let txResolved = false;
@@ -739,7 +761,7 @@ ${duration}
 
         const batchFetchSize = 100;
 
-        const declareCursorSQL = `declare ${cursorIdentifier} insensitive no scroll cursor without hold for\n${text}`;
+        const declareCursorSQL = `declare ${cursorIdentifier} insensitive no scroll cursor without hold for\n${executableSql}`;
         const pullViaCursorSQL = `fetch forward ${batchFetchSize} from ${cursorIdentifier}`;
         const releaseCursorSQL = `close ${cursorIdentifier}`;
 
@@ -956,19 +978,16 @@ ${duration}
   public async executeMutation<TData>(
     options: PgExecutorMutationOptions,
   ): Promise<PgClientResult<TData>> {
-    const { context, text, values } = options;
+    const { context, text: templateSql, values } = options;
     const { withPgClient, pgSettings } = context;
 
-    // Apply sqlTextTransform if provided (e.g. for multi-tenancy schema remapping)
-    const finalText = context.sqlTextTransform
-      ? context.sqlTextTransform(text)
-      : text;
+    const executableSql = this.prepareSql(templateSql, context);
 
     // We don't explicitly need a transaction for mutations
     const queryResult = await withPgClient(pgSettings, (client) =>
       this._executeWithClient<TData>(
         client,
-        finalText,
+        executableSql,
         values,
         undefined,
         undefined,
